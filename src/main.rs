@@ -25,6 +25,8 @@ Extra args after `add <name>` go to `claude auth login`, for example --email.";
 const CREDENTIAL_STALE: Duration = Duration::from_secs(60);
 const CONFIG_STALE: Duration = Duration::from_secs(10);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(9);
+// Keychain item that keeps a token of unknown owner during a repair.
+const RECOVERY_SERVICE: &str = "ccs-recovery";
 
 /// Everything a command touches, so tests can point it at a temp dir and an
 /// in-memory store.
@@ -220,8 +222,9 @@ fn switch(ctx: &Ctx, name: &str) -> Result<String, String> {
     let active_id = active.as_ref().and_then(claude::identity);
     // A switch that failed and could not roll back leaves this marker. The
     // default token may then belong to another account than ~/.claude.json
-    // names, so it is neither saved back nor trusted as "already on".
-    let marker = ctx.ccs_home.join(".switching");
+    // names, so it is neither saved back nor trusted as "already on". It sits
+    // next to the default profile, so every CCS_HOME sees it.
+    let marker = default.home.join(".ccs-switching");
     let unsure = marker.exists();
     if unsure {
         eprintln!("repairing an unfinished switch");
@@ -233,6 +236,16 @@ fn switch(ctx: &Ctx, name: &str) -> Result<String, String> {
         .read(&target.service)?
         .ok_or(format!("{name:?} has no saved token, run `ccs add {name}`"))?;
     let current = ctx.store.read(&default.service)?;
+
+    // The token's owner is unknown, but it may be the only valid copy of one,
+    // so keep it before it is overwritten.
+    if let Some(current) = current
+        .as_deref()
+        .filter(|c| unsure && claude::has_oauth(c))
+    {
+        ctx.store.write(RECOVERY_SERVICE, current)?;
+        eprintln!("kept the previous token in the Keychain item {RECOVERY_SERVICE:?}");
+    }
 
     // The active session rotates its refresh token, which voids the copy we
     // saved. Store the rotated token back before we overwrite it. An item with
@@ -284,7 +297,13 @@ fn switch(ctx: &Ctx, name: &str) -> Result<String, String> {
         let restored = match current.as_deref() {
             Some(c) => ctx.store.write(&default.service, c),
             None => ctx.store.delete(&default.service),
-        };
+        }
+        // A rollback write that failed may still have left the old value,
+        // for example when neither write reached the Keychain.
+        .or_else(|r| match ctx.store.read(&default.service) {
+            Ok(now) if now == current => Ok(()),
+            _ => Err(r),
+        });
         return Err(match restored {
             Ok(()) => {
                 // Back to the state before this switch, which was sure unless

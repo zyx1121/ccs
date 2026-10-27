@@ -159,7 +159,7 @@ fn switch_saves_the_rotated_token_and_keeps_mcp_logins() {
     // No lock or marker is left behind.
     assert!(!f.dir.join("home/.claude/.oauth_refresh.lock").exists());
     assert!(!f.dir.join("home/.claude.lock").exists());
-    assert!(!f.dir.join("ccs/.switching").exists());
+    assert!(!f.dir.join("home/.claude/.ccs-switching").exists());
     assert!(!f.dir.join("home/.claude.json.lock").exists());
 }
 
@@ -270,7 +270,7 @@ fn switch_repairs_a_failed_rollback_without_polluting_a_saved_token() {
 
     let err = switch(&f.ctx(), "b").unwrap_err();
     assert!(err.contains("also failed"), "{err}");
-    assert!(f.dir.join("ccs/.switching").exists());
+    assert!(f.dir.join("home/.claude/.ccs-switching").exists());
     // The mismatch the marker guards: b's token, a's identity.
     assert_eq!(
         f.item(claude::DEFAULT_SERVICE)["claudeAiOauth"]["refreshToken"],
@@ -288,7 +288,43 @@ fn switch_repairs_a_failed_rollback_without_polluting_a_saved_token() {
     let default = f.item(claude::DEFAULT_SERVICE);
     assert_eq!(default["claudeAiOauth"]["refreshToken"], "a-new");
     assert_eq!(default["mcpOAuth"]["server"], "mcp-login");
-    assert!(!f.dir.join("ccs/.switching").exists());
+    assert!(!f.dir.join("home/.claude/.ccs-switching").exists());
+    // The token of unknown owner is kept, not dropped.
+    assert_eq!(
+        f.item(RECOVERY_SERVICE)["claudeAiOauth"]["refreshToken"],
+        "b-1"
+    );
+}
+
+#[test]
+fn every_ccs_home_sees_an_unfinished_switch() {
+    let f = Fixture::new();
+    f.store.fail(claude::DEFAULT_SERVICE, &[true, false]);
+    switch(&f.ctx(), "b").unwrap_err();
+
+    // Another CCS_HOME that also saved account A.
+    let other = f.dir.join("other");
+    let a = other.join("a");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::write(
+        a.join(".claude.json"),
+        json!({"oauthAccount": account("A", "org", "a@x")}).to_string(),
+    )
+    .unwrap();
+    f.store
+        .write(&Profile::config_dir(&a).service, &credential("a-other", 1))
+        .unwrap();
+    let ctx = Ctx {
+        ccs_home: other,
+        ..f.ctx()
+    };
+    let msg = switch(&ctx, "a").unwrap();
+    assert!(msg.starts_with("switched to a"), "{msg}");
+    // b's token was not saved as a's.
+    assert_eq!(
+        f.item(&Profile::config_dir(&a).service)["claudeAiOauth"]["refreshToken"],
+        "a-other"
+    );
 }
 
 #[test]
@@ -296,5 +332,36 @@ fn a_restored_switch_clears_its_marker() {
     let f = Fixture::new();
     f.store.fail(claude::DEFAULT_SERVICE, &[true]);
     switch(&f.ctx(), "b").unwrap_err();
-    assert!(!f.dir.join("ccs/.switching").exists());
+    assert!(!f.dir.join("home/.claude/.ccs-switching").exists());
+}
+
+#[test]
+fn a_switch_that_changed_nothing_leaves_no_marker() {
+    let f = Fixture::new();
+    // Neither the switch write nor the rollback reaches the Keychain.
+    f.store.fail(claude::DEFAULT_SERVICE, &[false, false]);
+    let err = switch(&f.ctx(), "b").unwrap_err();
+    assert!(err.contains("previous login is restored"), "{err}");
+    assert!(!f.dir.join("home/.claude/.ccs-switching").exists());
+
+    // a keeps working and rotates its token; the next switch saves it.
+    f.store
+        .write(claude::DEFAULT_SERVICE, &f.default_with("a-rotated", 7))
+        .unwrap();
+    switch(&f.ctx(), "b").unwrap();
+    assert_eq!(
+        f.profile_item("a")["claudeAiOauth"]["refreshToken"],
+        "a-rotated"
+    );
+}
+
+#[test]
+fn a_restored_repair_keeps_the_marker() {
+    let f = Fixture::new();
+    f.store.fail(claude::DEFAULT_SERVICE, &[true, false]);
+    switch(&f.ctx(), "b").unwrap_err();
+    // The repair's own write fails but its rollback works: still unsure.
+    f.store.fail(claude::DEFAULT_SERVICE, &[true]);
+    switch(&f.ctx(), "a").unwrap_err();
+    assert!(f.dir.join("home/.claude/.ccs-switching").exists());
 }

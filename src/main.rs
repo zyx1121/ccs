@@ -3,6 +3,7 @@ mod keychain;
 mod lock;
 
 use claude::Profile;
+use keychain::{Keychain, Store};
 use lock::Lock;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -25,26 +26,50 @@ const CREDENTIAL_STALE: Duration = Duration::from_secs(60);
 const CONFIG_STALE: Duration = Duration::from_secs(10);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(9);
 
+/// Everything a command touches, so tests can point it at a temp dir and an
+/// in-memory store.
+struct Ctx<'a> {
+    /// Home of the default profile: `~/.claude` and `~/.claude.json` live here.
+    home: PathBuf,
+    /// One profile directory per account.
+    ccs_home: PathBuf,
+    /// Store for calls made while we hold Claude Code's locks.
+    store: &'a dyn Store,
+    /// Store for calls made before we take them, which may wait for an unlock.
+    patient: &'a dyn Store,
+}
+
 fn main() -> ExitCode {
+    let short = Keychain {
+        timeout: keychain::SHORT,
+    };
+    let long = Keychain {
+        timeout: keychain::LONG,
+    };
+    let ctx = Ctx {
+        home: claude::home_dir(),
+        ccs_home: ccs_home(),
+        store: &short,
+        patient: &long,
+    };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        [] | ["list"] | ["ls"] => list(),
-        ["-h"] | ["--help"] | ["help"] => {
-            println!("{USAGE}");
-            Ok(())
-        }
-        ["-V"] | ["--version"] => {
-            println!("ccs {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
-        ["add", name, ..] => add(name, &args[2..]),
-        ["switch", name] => switch(name),
-        ["rm", name] => remove(name),
-        [name] if !name.starts_with('-') => switch(name),
+        [] | ["list"] | ["ls"] => list(&ctx),
+        ["-h"] | ["--help"] | ["help"] => Ok(USAGE.to_string()),
+        ["-V"] | ["--version"] => Ok(format!("ccs {}", env!("CARGO_PKG_VERSION"))),
+        ["add", name, ..] => add(&ctx, name, &args[2..]),
+        ["switch", name] => switch(&ctx, name),
+        ["rm", name] => remove(&ctx, name),
+        [name] if !name.starts_with('-') => switch(&ctx, name),
         _ => Err(USAGE.to_string()),
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(msg) => {
+            if !msg.is_empty() {
+                println!("{msg}");
+            }
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("ccs: {e}");
             ExitCode::FAILURE
@@ -76,8 +101,8 @@ fn check_name(name: &str) -> Result<(), String> {
 }
 
 /// Saved accounts, sorted by name.
-fn accounts() -> Vec<(String, Profile)> {
-    let mut out: Vec<_> = std::fs::read_dir(ccs_home())
+fn accounts(ctx: &Ctx) -> Vec<(String, Profile)> {
+    let mut out: Vec<_> = std::fs::read_dir(&ctx.ccs_home)
         .into_iter()
         .flatten()
         .flatten()
@@ -92,39 +117,41 @@ fn accounts() -> Vec<(String, Profile)> {
     out
 }
 
-fn find(name: &str) -> Result<Profile, String> {
+fn find(ctx: &Ctx, name: &str) -> Result<Profile, String> {
     check_name(name)?;
-    let dir = ccs_home().join(name);
+    let dir = ctx.ccs_home.join(name);
     if !dir.is_dir() {
         return Err(format!("no account {name:?}, add it with `ccs add {name}`"));
     }
     Ok(Profile::config_dir(&dir))
 }
 
-fn list() -> Result<(), String> {
-    let accounts = accounts();
+fn list(ctx: &Ctx) -> Result<String, String> {
+    let accounts = accounts(ctx);
     if accounts.is_empty() {
-        println!("no accounts yet, add one with `ccs add <name>`");
-        return Ok(());
+        return Ok("no accounts yet, add one with `ccs add <name>`".into());
     }
-    let active = Profile::default_profile().account();
+    let active = Profile::default_profile(&ctx.home).account();
     let active_id = active.as_ref().and_then(claude::identity);
     let width = accounts.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-    for (name, profile) in &accounts {
-        let account = profile.account();
-        let mark = match account.as_ref().and_then(claude::identity) {
-            Some(id) if Some(id) == active_id => '*',
-            _ => ' ',
-        };
-        let email = account.as_ref().map_or("(not logged in)", claude::email);
-        println!("{mark} {name:width$}  {email}");
-    }
-    Ok(())
+    let lines: Vec<String> = accounts
+        .iter()
+        .map(|(name, profile)| {
+            let account = profile.account();
+            let mark = match account.as_ref().and_then(claude::identity) {
+                Some(id) if Some(id) == active_id => '*',
+                _ => ' ',
+            };
+            let email = account.as_ref().map_or("(not logged in)", claude::email);
+            format!("{mark} {name:width$}  {email}")
+        })
+        .collect();
+    Ok(lines.join("\n"))
 }
 
-fn add(name: &str, login_args: &[String]) -> Result<(), String> {
+fn add(ctx: &Ctx, name: &str, login_args: &[String]) -> Result<String, String> {
     check_name(name)?;
-    let dir = ccs_home().join(name);
+    let dir = ctx.ccs_home.join(name);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let status = Command::new("claude")
         .args(["auth", "login"])
@@ -140,25 +167,28 @@ fn add(name: &str, login_args: &[String]) -> Result<(), String> {
     let account = profile
         .account()
         .ok_or("login finished but no account was saved")?;
-    if keychain::read(&profile.service)?.is_none() {
+    if ctx.patient.read(&profile.service)?.is_none() {
         return Err(format!("login finished but {} is empty", profile.service));
     }
     let id = claude::identity(&account);
-    for (other, p) in accounts() {
+    for (other, p) in accounts(ctx) {
         if other != name && p.account().as_ref().and_then(claude::identity) == id {
             eprintln!("note: {other:?} is the same account");
         }
     }
-    println!("added {name} ({})", claude::email(&account));
-    Ok(())
+    Ok(format!("added {name} ({})", claude::email(&account)))
 }
 
-fn switch(name: &str) -> Result<(), String> {
-    let target = find(name)?;
+fn switch(ctx: &Ctx, name: &str) -> Result<String, String> {
+    let target = find(ctx, name)?;
     let account = target
         .account()
         .ok_or(format!("{name:?} is not logged in, run `ccs add {name}`"))?;
-    let default = Profile::default_profile();
+    let default = Profile::default_profile(&ctx.home);
+
+    // A locked Keychain shows an unlock dialog on the first read. Let that
+    // happen now, before we hold locks that Claude Code waits on.
+    ctx.patient.read(&default.service)?;
 
     // Same order as Claude Code's token refresh: new lock, legacy lock, config lock.
     let lock_path = |p: &Profile, suffix: &str| {
@@ -189,17 +219,19 @@ fn switch(name: &str) -> Result<(), String> {
     let active = default.account();
     let active_id = active.as_ref().and_then(claude::identity);
     if active_id.is_some() && active_id == claude::identity(&account) {
-        println!("already on {name} ({})", claude::email(&account));
-        return Ok(());
+        return Ok(format!("already on {name} ({})", claude::email(&account)));
     }
-    let target_credential = keychain::read(&target.service)?
+    let target_credential = ctx
+        .store
+        .read(&target.service)?
         .ok_or(format!("{name:?} has no saved token, run `ccs add {name}`"))?;
-    let current = keychain::read(&default.service)?;
+    let current = ctx.store.read(&default.service)?;
 
     // The active session rotates its refresh token, which voids the copy we
-    // saved. Store the rotated token back before we overwrite it.
-    if let Some(current) = current.as_deref() {
-        let owners: Vec<_> = accounts()
+    // saved. Store the rotated token back before we overwrite it. An item with
+    // only MCP logins holds no Claude login to lose.
+    if let Some(current) = current.as_deref().filter(|c| claude::has_oauth(c)) {
+        let owners: Vec<_> = accounts(ctx)
             .into_iter()
             .filter(|(_, p)| {
                 active_id.is_some() && p.account().as_ref().and_then(claude::identity) == active_id
@@ -213,9 +245,9 @@ fn switch(name: &str) -> Result<(), String> {
             ));
         }
         for (other, p) in owners {
-            let saved = keychain::read(&p.service)?;
+            let saved = ctx.store.read(&p.service)?;
             if saved.as_deref().map_or(0, claude::expires_at) < claude::expires_at(current) {
-                keychain::write(
+                ctx.store.write(
                     &p.service,
                     &claude::splice_oauth(saved.as_deref(), current)?,
                 )?;
@@ -227,16 +259,18 @@ fn switch(name: &str) -> Result<(), String> {
     let body = std::fs::read_to_string(&default.config)
         .map_err(|e| format!("read {}: {e}", default.config.display()))?;
     let new_body = claude::splice_account(&body, &account)?;
-    keychain::write(
-        &default.service,
-        &claude::splice_oauth(current.as_deref(), &target_credential)?,
-    )?;
-    // Token and identity must name the same account. If the config write
-    // fails, put the old token back.
-    if let Err(e) = claude::write_atomic(&default.config, &new_body) {
+    let new_credential = claude::splice_oauth(current.as_deref(), &target_credential)?;
+
+    // Token and identity must name the same account. If either write fails,
+    // put the old token back; the config is replaced last and atomically.
+    let applied = ctx
+        .store
+        .write(&default.service, &new_credential)
+        .and_then(|()| claude::write_atomic(&default.config, &new_body));
+    if let Err(e) = applied {
         let restored = match current.as_deref() {
-            Some(c) => keychain::write(&default.service, c),
-            None => keychain::delete(&default.service),
+            Some(c) => ctx.store.write(&default.service, c),
+            None => ctx.store.delete(&default.service),
         };
         return Err(match restored {
             Ok(()) => format!("{e}; the previous login is restored"),
@@ -244,18 +278,21 @@ fn switch(name: &str) -> Result<(), String> {
         });
     }
 
-    println!("switched to {name} ({})", claude::email(&account));
-    println!("restart running Claude Code sessions to use it");
-    Ok(())
+    Ok(format!(
+        "switched to {name} ({})\nrestart running Claude Code sessions to use it",
+        claude::email(&account)
+    ))
 }
 
-fn remove(name: &str) -> Result<(), String> {
-    let profile = find(name)?;
+fn remove(ctx: &Ctx, name: &str) -> Result<String, String> {
+    let profile = find(ctx, name)?;
     // Delete the directory first: a directory without a token would still
     // list as an account, a leftover Keychain item is invisible.
     std::fs::remove_dir_all(&profile.home)
         .map_err(|e| format!("remove {}: {e}", profile.home.display()))?;
-    keychain::delete(&profile.service)?;
-    println!("removed {name}");
-    Ok(())
+    ctx.patient.delete(&profile.service)?;
+    Ok(format!("removed {name}"))
 }
+
+#[cfg(test)]
+mod tests;

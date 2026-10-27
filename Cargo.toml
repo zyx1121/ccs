@@ -1,0 +1,17 @@
+[package]
+name = "ccs"
+version = "0.0.0"
+edition = "2024"
+description = "Switch Claude Code accounts on macOS with one command"
+license = "MIT"
+repository = "https://github.com/zyx1121/ccs"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+unicode-normalization = "0.1"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1

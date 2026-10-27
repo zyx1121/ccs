@@ -218,7 +218,14 @@ fn switch(ctx: &Ctx, name: &str) -> Result<String, String> {
     // refresh cannot pair one account's identity with another's token.
     let active = default.account();
     let active_id = active.as_ref().and_then(claude::identity);
-    if active_id.is_some() && active_id == claude::identity(&account) {
+    // A switch that failed and could not roll back leaves this marker. The
+    // default token may then belong to another account than ~/.claude.json
+    // names, so it is neither saved back nor trusted as "already on".
+    let marker = ctx.ccs_home.join(".switching");
+    let unsure = marker.exists();
+    if unsure {
+        eprintln!("repairing an unfinished switch");
+    } else if active_id.is_some() && active_id == claude::identity(&account) {
         return Ok(format!("already on {name} ({})", claude::email(&account)));
     }
     let target_credential = ctx
@@ -230,7 +237,10 @@ fn switch(ctx: &Ctx, name: &str) -> Result<String, String> {
     // The active session rotates its refresh token, which voids the copy we
     // saved. Store the rotated token back before we overwrite it. An item with
     // only MCP logins holds no Claude login to lose.
-    if let Some(current) = current.as_deref().filter(|c| claude::has_oauth(c)) {
+    if let Some(current) = current
+        .as_deref()
+        .filter(|c| !unsure && claude::has_oauth(c))
+    {
         let owners: Vec<_> = accounts(ctx)
             .into_iter()
             .filter(|(_, p)| {
@@ -261,6 +271,9 @@ fn switch(ctx: &Ctx, name: &str) -> Result<String, String> {
     let new_body = claude::splice_account(&body, &account)?;
     let new_credential = claude::splice_oauth(current.as_deref(), &target_credential)?;
 
+    std::fs::write(&marker, format!("to {name}\n"))
+        .map_err(|e| format!("write {}: {e}", marker.display()))?;
+
     // Token and identity must name the same account. If either write fails,
     // put the old token back; the config is replaced last and atomically.
     let applied = ctx
@@ -273,10 +286,26 @@ fn switch(ctx: &Ctx, name: &str) -> Result<String, String> {
             None => ctx.store.delete(&default.service),
         };
         return Err(match restored {
-            Ok(()) => format!("{e}; the previous login is restored"),
-            Err(r) => format!("{e}; restoring the previous login also failed: {r}"),
+            Ok(()) => {
+                // Back to the state before this switch, which was sure unless
+                // the marker was already there.
+                if !unsure {
+                    let _ = std::fs::remove_file(&marker);
+                }
+                format!("{e}; the previous login is restored")
+            }
+            Err(r) => format!(
+                "{e}; restoring the previous login also failed: {r}; \
+                 run `ccs <name>` again to repair"
+            ),
         });
     }
+    std::fs::remove_file(&marker).map_err(|e| {
+        format!(
+            "switched to {name}, but could not remove {}: {e}",
+            marker.display()
+        )
+    })?;
 
     Ok(format!(
         "switched to {name} ({})\nrestart running Claude Code sessions to use it",

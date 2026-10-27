@@ -9,8 +9,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[derive(Default)]
 struct MemStore {
     items: RefCell<HashMap<String, String>>,
-    /// The next write to this service stores the value, then reports failure.
-    fail_next_write: RefCell<Option<String>>,
+    /// Upcoming writes to a service that fail, in order. `true` stores the
+    /// value before failing, `false` fails without storing it.
+    failures: RefCell<HashMap<String, Vec<bool>>>,
+}
+
+impl MemStore {
+    fn fail(&self, service: &str, writes: &[bool]) {
+        self.failures
+            .borrow_mut()
+            .insert(service.into(), writes.to_vec());
+    }
 }
 
 impl Store for MemStore {
@@ -18,12 +27,19 @@ impl Store for MemStore {
         Ok(self.items.borrow().get(service).cloned())
     }
     fn write(&self, service: &str, value: &str) -> Result<(), String> {
-        self.items.borrow_mut().insert(service.into(), value.into());
-        if self.fail_next_write.borrow().as_deref() == Some(service) {
-            *self.fail_next_write.borrow_mut() = None;
-            return Err("injected write failure".into());
+        let next = self
+            .failures
+            .borrow_mut()
+            .get_mut(service)
+            .filter(|q| !q.is_empty())
+            .map(|q| q.remove(0));
+        if next != Some(false) {
+            self.items.borrow_mut().insert(service.into(), value.into());
         }
-        Ok(())
+        match next {
+            Some(_) => Err("injected write failure".into()),
+            None => Ok(()),
+        }
     }
     fn delete(&self, service: &str) -> Result<(), String> {
         self.items.borrow_mut().remove(service);
@@ -140,8 +156,10 @@ fn switch_saves_the_rotated_token_and_keeps_mcp_logins() {
     let default = f.item(claude::DEFAULT_SERVICE);
     assert_eq!(default["claudeAiOauth"]["refreshToken"], "a-new");
     assert_eq!(default["mcpOAuth"]["server"], "mcp-login");
-    // No lock is left behind.
+    // No lock or marker is left behind.
+    assert!(!f.dir.join("home/.claude/.oauth_refresh.lock").exists());
     assert!(!f.dir.join("home/.claude.lock").exists());
+    assert!(!f.dir.join("ccs/.switching").exists());
     assert!(!f.dir.join("home/.claude.json.lock").exists());
 }
 
@@ -224,7 +242,7 @@ fn switch_restores_the_token_when_the_config_write_fails() {
 fn switch_restores_the_token_when_the_keychain_write_fails() {
     let f = Fixture::new();
     let before = f.store.read(claude::DEFAULT_SERVICE).unwrap();
-    *f.store.fail_next_write.borrow_mut() = Some(claude::DEFAULT_SERVICE.into());
+    f.store.fail(claude::DEFAULT_SERVICE, &[true]);
 
     let err = switch(&f.ctx(), "b").unwrap_err();
     assert!(err.contains("previous login is restored"), "{err}");
@@ -240,4 +258,43 @@ fn remove_deletes_the_profile_and_its_item() {
     assert!(!f.dir.join("ccs/b").exists());
     assert!(f.store.read(&service).unwrap().is_none());
     assert_eq!(list(&f.ctx()).unwrap(), "* a  a@x");
+}
+
+#[test]
+fn switch_repairs_a_failed_rollback_without_polluting_a_saved_token() {
+    let f = Fixture::new();
+    // b's token expires later than a's, so a careless save-back would take it.
+    f.save("b", account("B", "org", "b@x"), &credential("b-1", 9));
+    // The write of b's token lands but reports failure, then the rollback fails.
+    f.store.fail(claude::DEFAULT_SERVICE, &[true, false]);
+
+    let err = switch(&f.ctx(), "b").unwrap_err();
+    assert!(err.contains("also failed"), "{err}");
+    assert!(f.dir.join("ccs/.switching").exists());
+    // The mismatch the marker guards: b's token, a's identity.
+    assert_eq!(
+        f.item(claude::DEFAULT_SERVICE)["claudeAiOauth"]["refreshToken"],
+        "b-1"
+    );
+    assert_eq!(f.config()["oauthAccount"]["emailAddress"], "a@x");
+
+    // The retry does not trust the token: no "already on", no save-back.
+    let msg = switch(&f.ctx(), "a").unwrap();
+    assert!(msg.starts_with("switched to a"), "{msg}");
+    assert_eq!(
+        f.profile_item("a")["claudeAiOauth"]["refreshToken"],
+        "a-new"
+    );
+    let default = f.item(claude::DEFAULT_SERVICE);
+    assert_eq!(default["claudeAiOauth"]["refreshToken"], "a-new");
+    assert_eq!(default["mcpOAuth"]["server"], "mcp-login");
+    assert!(!f.dir.join("ccs/.switching").exists());
+}
+
+#[test]
+fn a_restored_switch_clears_its_marker() {
+    let f = Fixture::new();
+    f.store.fail(claude::DEFAULT_SERVICE, &[true]);
+    switch(&f.ctx(), "b").unwrap_err();
+    assert!(!f.dir.join("ccs/.switching").exists());
 }

@@ -14,6 +14,8 @@
 - Hash the exact `CLAUDE_CONFIG_DIR` string that `add` exports. Never resolve or canonicalize it.
 - Take the locks in Claude Code's order: `.oauth_refresh.lock`, `~/.claude.lock`, `~/.claude.json.lock`.
 - Never run `claude auth logout` for an account. It can revoke the refresh token that ccs saved.
+- `~/.claude/.ccs-switching` marks a switch that could not roll back. While it exists, never save the default token back to a profile; keep it in the `ccs-recovery` item first.
+- Every switch path needs a test in `src/tests.rs` against `MemStore`, including failed writes.
 
 ## Verify
 

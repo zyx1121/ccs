@@ -83,7 +83,7 @@ Facts for coding agents and LLM tools. The rules for changing the code are in [A
 - **Run**: `ccs <name>`
 - **Verify**: `ccs && claude auth status --json`
 - **Config**: `CCS_HOME`
-- **Secrets**: OAuth tokens stay in the macOS login Keychain, never in files.
+- **Secrets**: OAuth tokens stay in the macOS login Keychain, never in files. A repaired switch keeps a token of unknown owner in the `ccs-recovery` item.
 - **Limits**: macOS only. Running sessions keep the old account until they restart. ccs switches only the default profile, not a `CLAUDE_CONFIG_DIR` profile.
 
 ## Development

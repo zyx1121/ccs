@@ -1,19 +1,33 @@
-//! macOS Keychain access through `/usr/bin/security`, the same binary Claude
-//! Code uses. Going through it keeps the item ACLs unchanged, so neither tool
-//! triggers a "wants to use your keychain" prompt.
+//! macOS Keychain access through `/usr/bin/security`, the binary Claude Code
+//! uses. Its items trust only that binary, so any other caller, including
+//! Security.framework from this process, can trigger an access dialog.
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Where account credentials live. The real one is [`Keychain`]; tests use an
+/// in-memory store.
+pub trait Store {
+    fn read(&self, service: &str) -> Result<Option<String>, String>;
+    fn write(&self, service: &str, value: &str) -> Result<(), String>;
+    fn delete(&self, service: &str) -> Result<(), String>;
+}
+
+pub struct Keychain {
+    /// Limit for one `security` call. Short while we hold Claude Code's locks,
+    /// long when a Keychain unlock dialog may be waiting for the user.
+    pub timeout: Duration,
+}
+
+pub const SHORT: Duration = Duration::from_secs(5);
+pub const LONG: Duration = Duration::from_secs(120);
+
 const SECURITY: &str = "/usr/bin/security";
 const NOT_FOUND: i32 = 44;
-// `security -i` reads stdin with a 4096-byte line buffer.
+// `security -i` reads stdin with a 4096-byte line buffer; Claude Code uses 4032.
 const STDIN_LINE_LIMIT: usize = 4096 - 64;
-// A locked Keychain can block `security` on an unlock dialog; never wait on it
-// while we hold Claude Code's locks.
-const TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Output {
     code: Option<i32>,
@@ -21,7 +35,7 @@ struct Output {
     stderr: String,
 }
 
-fn run(args: &[&str], input: Option<&str>) -> Result<Output, String> {
+fn run(args: &[&str], input: Option<&str>, timeout: Duration) -> Result<Output, String> {
     let mut child = Command::new(SECURITY)
         .args(args)
         .stdin(if input.is_some() {
@@ -55,7 +69,7 @@ fn run(args: &[&str], input: Option<&str>) -> Result<Output, String> {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             break status;
         }
-        if start.elapsed() > TIMEOUT {
+        if start.elapsed() > timeout {
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!(
@@ -72,47 +86,55 @@ fn run(args: &[&str], input: Option<&str>) -> Result<Output, String> {
     })
 }
 
-/// Account attribute Claude Code keys its item with: `$USER` when it is a
-/// plain name, else `claude-code-user`.
+/// Account attribute Claude Code keys its item with: `$USER`, else the OS
+/// user name, and `claude-code-user` when that is not a plain name.
 pub fn user() -> String {
-    match std::env::var("USER") {
-        Ok(u)
-            if !u.is_empty()
-                && u.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) =>
-        {
-            u
-        }
-        _ => "claude-code-user".to_string(),
-    }
-}
-
-pub fn read(service: &str) -> Result<Option<String>, String> {
-    let out = run(
-        &["find-generic-password", "-a", &user(), "-s", service, "-w"],
-        None,
-    )?;
-    match out.code {
-        Some(0) => Ok(Some(out.stdout.trim_end().to_string())),
-        Some(NOT_FOUND) => Ok(None),
-        _ => Err(format!(
-            "security find-generic-password failed: {}",
-            out.stderr.trim()
-        )),
-    }
-}
-
-pub fn write(service: &str, value: &str) -> Result<(), String> {
-    let hex: String = value.bytes().map(|b| format!("{b:02x}")).collect();
-    let user = user();
-    let line = format!("add-generic-password -U -a {user:?} -s {service:?} -X {hex}\n");
-    // Prefer stdin so the secret stays out of argv. A longer value cannot fit
-    // the line buffer, so it goes through argv, as Claude Code does.
-    let out = if line.len() <= STDIN_LINE_LIMIT {
-        run(&["-i"], Some(&line))?
+    let name = std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .or_else(|| {
+            let out = Command::new("/usr/bin/id").arg("-un").output().ok()?;
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        })
+        .unwrap_or_default();
+    let plain = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    if plain {
+        name
     } else {
-        run(
-            &[
+        "claude-code-user".to_string()
+    }
+}
+
+impl Store for Keychain {
+    fn read(&self, service: &str) -> Result<Option<String>, String> {
+        let out = run(
+            &["find-generic-password", "-a", &user(), "-s", service, "-w"],
+            None,
+            self.timeout,
+        )?;
+        match out.code {
+            Some(0) => Ok(Some(out.stdout.trim_end().to_string())),
+            Some(NOT_FOUND) => Ok(None),
+            _ => Err(format!(
+                "security find-generic-password failed: {}",
+                out.stderr.trim()
+            )),
+        }
+    }
+
+    fn write(&self, service: &str, value: &str) -> Result<(), String> {
+        let hex: String = value.bytes().map(|b| format!("{b:02x}")).collect();
+        let user = user();
+        let line = format!("add-generic-password -U -a {user:?} -s {service:?} -X {hex}\n");
+        // Prefer stdin so the secret stays out of argv. A longer value cannot
+        // fit the line buffer and goes through argv, as Claude Code does (#2).
+        let out = if line.len() <= STDIN_LINE_LIMIT {
+            run(&["-i"], Some(&line), self.timeout)?
+        } else {
+            let args = [
                 "add-generic-password",
                 "-U",
                 "-a",
@@ -121,30 +143,31 @@ pub fn write(service: &str, value: &str) -> Result<(), String> {
                 service,
                 "-X",
                 &hex,
-            ],
-            None,
-        )?
-    };
-    // `security -i` exits 0 even when a command fails, so read the value back.
-    if out.code != Some(0) || read(service)?.as_deref() != Some(value) {
-        return Err(format!(
-            "security add-generic-password failed for {service}: {}",
-            out.stderr.trim()
-        ));
+            ];
+            run(&args, None, self.timeout)?
+        };
+        // `security -i` exits 0 even when a command fails, so read the value back.
+        if out.code != Some(0) || self.read(service)?.as_deref() != Some(value) {
+            return Err(format!(
+                "security add-generic-password failed for {service}: {}",
+                out.stderr.trim()
+            ));
+        }
+        Ok(())
     }
-    Ok(())
-}
 
-pub fn delete(service: &str) -> Result<(), String> {
-    let out = run(
-        &["delete-generic-password", "-a", &user(), "-s", service],
-        None,
-    )?;
-    match out.code {
-        Some(0) | Some(NOT_FOUND) => Ok(()),
-        _ => Err(format!(
-            "security delete-generic-password failed: {}",
-            out.stderr.trim()
-        )),
+    fn delete(&self, service: &str) -> Result<(), String> {
+        let out = run(
+            &["delete-generic-password", "-a", &user(), "-s", service],
+            None,
+            self.timeout,
+        )?;
+        match out.code {
+            Some(0) | Some(NOT_FOUND) => Ok(()),
+            _ => Err(format!(
+                "security delete-generic-password failed: {}",
+                out.stderr.trim()
+            )),
+        }
     }
 }

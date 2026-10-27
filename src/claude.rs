@@ -19,8 +19,8 @@ pub struct Profile {
 }
 
 impl Profile {
-    pub fn default_profile() -> Profile {
-        let home = home_dir();
+    /// The profile Claude Code uses when `CLAUDE_CONFIG_DIR` is unset.
+    pub fn default_profile(home: &Path) -> Profile {
         Profile {
             home: home.join(".claude"),
             config: home.join(".claude.json"),
@@ -76,7 +76,11 @@ pub fn splice_account(body: &str, account: &Map<String, Value>) -> Result<String
 /// Write through a temp file and rename, so Claude Code never reads half a file.
 pub fn write_atomic(path: &Path, body: &str) -> Result<(), String> {
     use std::io::Write;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
+    unsafe extern "C" {
+        fn fsync(fd: i32) -> i32;
+    }
     let tmp = path.with_extension(format!("json.ccs-{}", std::process::id()));
     let result = std::fs::OpenOptions::new()
         .write(true)
@@ -85,7 +89,12 @@ pub fn write_atomic(path: &Path, body: &str) -> Result<(), String> {
         .open(&tmp)
         .and_then(|mut f| {
             f.write_all(body.as_bytes())?;
-            f.sync_all()
+            // Plain fsync(2): Rust's sync_all is F_FULLFSYNC on macOS, which
+            // flushes the whole drive cache and takes seconds.
+            match unsafe { fsync(f.as_raw_fd()) } {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
         })
         .map_err(|e| format!("write {}: {e}", tmp.display()))
         .and_then(|()| {
@@ -130,6 +139,13 @@ pub fn splice_oauth(into: Option<&str>, from: &str) -> Result<String, String> {
         .ok_or("credential is not an object")?
         .insert("claudeAiOauth".into(), oauth);
     serde_json::to_string(&into).map_err(|e| e.to_string())
+}
+
+/// Whether a stored credential holds a Claude login, not only MCP logins.
+pub fn has_oauth(credential: &str) -> bool {
+    serde_json::from_str::<Value>(credential)
+        .ok()
+        .is_some_and(|v| v.get("claudeAiOauth").is_some_and(Value::is_object))
 }
 
 /// `claudeAiOauth.expiresAt` of a stored credential; a later one is fresher.

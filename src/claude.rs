@@ -75,18 +75,36 @@ pub fn splice_account(body: &str, account: &Map<String, Value>) -> Result<String
 
 /// Write through a temp file and rename, so Claude Code never reads half a file.
 pub fn write_atomic(path: &Path, body: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension(format!("json.ccs-{}", std::process::id()));
-    std::fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| {
+            f.write_all(body.as_bytes())?;
+            f.sync_all()
+        })
+        .map_err(|e| format!("write {}: {e}", tmp.display()))
+        .and_then(|()| {
+            std::fs::rename(&tmp, path).map_err(|e| format!("replace {}: {e}", path.display()))
+        });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path).map_err(|e| format!("replace {}: {e}", path.display()))
+    result
 }
 
-pub fn account_uuid(account: &Map<String, Value>) -> Option<&str> {
-    account.get("accountUuid")?.as_str()
+/// Claude Code treats a login as the same only when both the account and the
+/// organization match: one person can sit in a personal and a team org.
+pub fn identity(account: &Map<String, Value>) -> Option<(&str, &str)> {
+    let org = account
+        .get("organizationUuid")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    Some((account.get("accountUuid")?.as_str()?, org))
 }
 
 pub fn email(account: &Map<String, Value>) -> &str {
@@ -159,6 +177,21 @@ mod tests {
         assert_eq!(out["claudeAiOauth"]["expiresAt"], 9);
         let fresh: Value = serde_json::from_str(&splice_oauth(None, from).unwrap()).unwrap();
         assert_eq!(fresh, json!({"claudeAiOauth": {"expiresAt": 9}}));
+    }
+
+    #[test]
+    fn identity_includes_the_org() {
+        let personal = json!({"accountUuid": "a", "organizationUuid": "p"});
+        let team = json!({"accountUuid": "a", "organizationUuid": "t"});
+        let id = |v: &Value| {
+            identity(v.as_object().unwrap()).map(|(a, o)| (a.to_string(), o.to_string()))
+        };
+        assert_ne!(id(&personal), id(&team));
+        assert_eq!(
+            id(&json!({"accountUuid": "a"})),
+            Some(("a".into(), "".into()))
+        );
+        assert_eq!(id(&json!({})), None);
     }
 
     #[test]

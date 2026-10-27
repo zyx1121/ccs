@@ -53,9 +53,12 @@ fn main() -> ExitCode {
 }
 
 fn ccs_home() -> PathBuf {
-    std::env::var_os("CCS_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| claude::home_dir().join(".ccs"))
+    // The Keychain item is named after this path, so it must not depend on cwd.
+    match std::env::var_os("CCS_HOME").map(PathBuf::from) {
+        Some(p) if p.is_absolute() => p,
+        Some(p) => std::env::current_dir().map(|d| d.join(&p)).unwrap_or(p),
+        None => claude::home_dir().join(".ccs"),
+    }
 }
 
 fn check_name(name: &str) -> Result<(), String> {
@@ -105,12 +108,12 @@ fn list() -> Result<(), String> {
         return Ok(());
     }
     let active = Profile::default_profile().account();
-    let active_uuid = active.as_ref().and_then(claude::account_uuid);
+    let active_id = active.as_ref().and_then(claude::identity);
     let width = accounts.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
     for (name, profile) in &accounts {
         let account = profile.account();
-        let mark = match account.as_ref().and_then(claude::account_uuid) {
-            Some(uuid) if Some(uuid) == active_uuid => '*',
+        let mark = match account.as_ref().and_then(claude::identity) {
+            Some(id) if Some(id) == active_id => '*',
             _ => ' ',
         };
         let email = account.as_ref().map_or("(not logged in)", claude::email);
@@ -140,9 +143,9 @@ fn add(name: &str, login_args: &[String]) -> Result<(), String> {
     if keychain::read(&profile.service)?.is_none() {
         return Err(format!("login finished but {} is empty", profile.service));
     }
-    let uuid = claude::account_uuid(&account);
+    let id = claude::identity(&account);
     for (other, p) in accounts() {
-        if other != name && p.account().as_ref().and_then(claude::account_uuid) == uuid {
+        if other != name && p.account().as_ref().and_then(claude::identity) == id {
             eprintln!("note: {other:?} is the same account");
         }
     }
@@ -156,12 +159,6 @@ fn switch(name: &str) -> Result<(), String> {
         .account()
         .ok_or(format!("{name:?} is not logged in, run `ccs add {name}`"))?;
     let default = Profile::default_profile();
-    let active = default.account();
-    let active_uuid = active.as_ref().and_then(claude::account_uuid);
-    if active_uuid.is_some() && active_uuid == claude::account_uuid(&account) {
-        println!("already on {name} ({})", claude::email(&account));
-        return Ok(());
-    }
 
     // Same order as Claude Code's token refresh: new lock, legacy lock, config lock.
     let lock_path = |p: &Profile, suffix: &str| {
@@ -187,22 +184,31 @@ fn switch(name: &str) -> Result<(), String> {
         )?,
     ];
 
+    // Read the active state only under the locks, so a concurrent switch or
+    // refresh cannot pair one account's identity with another's token.
+    let active = default.account();
+    let active_id = active.as_ref().and_then(claude::identity);
+    if active_id.is_some() && active_id == claude::identity(&account) {
+        println!("already on {name} ({})", claude::email(&account));
+        return Ok(());
+    }
     let target_credential = keychain::read(&target.service)?
         .ok_or(format!("{name:?} has no saved token, run `ccs add {name}`"))?;
-
     let current = keychain::read(&default.service)?;
 
     // The active session rotates its refresh token, which voids the copy we
     // saved. Store the rotated token back before we overwrite it.
-    if let (Some(uuid), Some(current)) = (active_uuid, current.as_deref()) {
+    if let Some(current) = current.as_deref() {
         let owners: Vec<_> = accounts()
             .into_iter()
-            .filter(|(_, p)| p.account().as_ref().and_then(claude::account_uuid) == Some(uuid))
+            .filter(|(_, p)| {
+                active_id.is_some() && p.account().as_ref().and_then(claude::identity) == active_id
+            })
             .collect();
         if owners.is_empty() {
-            let email = active.as_ref().map_or("?", claude::email);
+            let email = active.as_ref().map_or("an unknown account", claude::email);
             return Err(format!(
-                "the active account ({email}) is not saved in ccs, \
+                "the active login ({email}) is not saved in ccs, \
                  switching would log it out; add it first with `ccs add <name>`"
             ));
         }
@@ -225,7 +231,18 @@ fn switch(name: &str) -> Result<(), String> {
         &default.service,
         &claude::splice_oauth(current.as_deref(), &target_credential)?,
     )?;
-    claude::write_atomic(&default.config, &new_body)?;
+    // Token and identity must name the same account. If the config write
+    // fails, put the old token back.
+    if let Err(e) = claude::write_atomic(&default.config, &new_body) {
+        let restored = match current.as_deref() {
+            Some(c) => keychain::write(&default.service, c),
+            None => keychain::delete(&default.service),
+        };
+        return Err(match restored {
+            Ok(()) => format!("{e}; the previous login is restored"),
+            Err(r) => format!("{e}; restoring the previous login also failed: {r}"),
+        });
+    }
 
     println!("switched to {name} ({})", claude::email(&account));
     println!("restart running Claude Code sessions to use it");
@@ -234,9 +251,11 @@ fn switch(name: &str) -> Result<(), String> {
 
 fn remove(name: &str) -> Result<(), String> {
     let profile = find(name)?;
-    keychain::delete(&profile.service)?;
+    // Delete the directory first: a directory without a token would still
+    // list as an account, a leftover Keychain item is invisible.
     std::fs::remove_dir_all(&profile.home)
         .map_err(|e| format!("remove {}: {e}", profile.home.display()))?;
+    keychain::delete(&profile.service)?;
     println!("removed {name}");
     Ok(())
 }
